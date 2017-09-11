@@ -19,8 +19,8 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 import com.facebook.react.uimanager.IllegalViewOperationException;
 import com.google.android.gms.cast.ApplicationMetadata;
 import com.google.android.gms.cast.CastDevice;
-import com.google.android.gms.cast.MediaInfo;
 import com.google.android.gms.cast.CastMediaControlIntent;
+import com.google.android.gms.cast.MediaInfo;
 import com.google.android.libraries.cast.companionlibrary.cast.CastConfiguration;
 import com.google.android.libraries.cast.companionlibrary.cast.VideoCastManager;
 import com.google.android.libraries.cast.companionlibrary.cast.callbacks.VideoCastConsumer;
@@ -30,25 +30,35 @@ import com.google.android.libraries.cast.companionlibrary.cast.exceptions.NoConn
 import com.google.android.libraries.cast.companionlibrary.cast.exceptions.TransientNetworkDisconnectionException;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
  * Created by Charlie on 5/29/16.
  */
 public class GoogleCastModule extends ReactContextBaseJavaModule implements LifecycleEventListener {
-    private VideoCastManager mCastManager;
-    private VideoCastConsumer mCastConsumer;
-    Map<String, MediaRouter.RouteInfo> currentDevices = new HashMap<>();
-    private WritableMap deviceAvailableParams;
-
 
     @VisibleForTesting
     public static final String REACT_CLASS = "GoogleCastModule";
-
     private static final String DEVICE_AVAILABLE = "GoogleCast:DeviceAvailable";
     private static final String DEVICE_CONNECTED = "GoogleCast:DeviceConnected";
     private static final String DEVICE_DISCONNECTED = "GoogleCast:DeviceDisconnected";
     private static final String MEDIA_LOADED = "GoogleCast:MediaLoaded";
+
+    private VideoCastManager mCastManager;
+    private VideoCastConsumer mCastConsumer;
+
+    private DevicesManager devicesManager;
+    private DevicesManager.OnChangeRoutes onChangeRoutes = new DevicesManager.OnChangeRoutes() {
+        @Override
+        public void onChangeRoutes(List<MediaRouter.RouteInfo> routes) {
+            boolean castPresent = routes.size() > 0;
+            WritableMap deviceAvailableParams = Arguments.createMap();
+            Log.e(REACT_CLASS, "onChangeRoutes: exists? " + Boolean.toString(castPresent));
+            deviceAvailableParams.putBoolean("device_available", castPresent);
+            emitMessageToRN(getReactApplicationContext(), DEVICE_AVAILABLE, deviceAvailableParams);
+        }
+    };
 
     public GoogleCastModule(ReactApplicationContext reactContext) {
         super(reactContext);
@@ -76,37 +86,38 @@ public class GoogleCastModule extends ReactContextBaseJavaModule implements Life
                 .emit(eventName, params);
     }
 
-    private void addDevice(MediaRouter.RouteInfo info) {
-        currentDevices.put(info.getId(), info);
-    }
-
-    private void removeDevice(MediaRouter.RouteInfo info) {
-        currentDevices.remove(info.getId());
-    }
-
     @ReactMethod
     public void stopScan() {
         Log.e(REACT_CLASS, "Stopping Scan");
         if (mCastManager != null) {
             mCastManager.decrementUiCounter();
         }
+        if (devicesManager != null) {
+            devicesManager.stopScan();
+        }
     }
 
     @ReactMethod
-    public void getDevices(Promise promise) {
-        WritableArray devicesList = Arguments.createArray();
-        try {
-            Log.e(REACT_CLASS, "devices size " + currentDevices.size());
-            for (MediaRouter.RouteInfo existingChromecasts : currentDevices.values()) {
-                WritableMap singleDevice = Arguments.createMap();
-                singleDevice.putString("id", existingChromecasts.getId());
-                singleDevice.putString("name", existingChromecasts.getName());
-                devicesList.pushMap(singleDevice);
+    public void getDevices(final Promise promise) {
+        UiThreadUtil.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    List<MediaRouter.RouteInfo> devices = devicesManager.getRouters();
+                    Log.e(REACT_CLASS, "devices size " + devices.size());
+                    WritableArray devicesList = Arguments.createArray();
+                    for (MediaRouter.RouteInfo device : devices) {
+                        WritableMap singleDevice = Arguments.createMap();
+                        singleDevice.putString("id", device.getId());
+                        singleDevice.putString("name", device.getName());
+                        devicesList.pushMap(singleDevice);
+                    }
+                    promise.resolve(devicesList);
+                } catch (Exception e) {
+                    promise.reject(e);
+                }
             }
-            promise.resolve(devicesList);
-        } catch (IllegalViewOperationException e) {
-            promise.reject(e);
-        }
+        });
     }
 
     @ReactMethod
@@ -132,16 +143,27 @@ public class GoogleCastModule extends ReactContextBaseJavaModule implements Life
     }
 
     @ReactMethod
-    public void connectToDevice(@Nullable String deviceId) {
+    public void connectToDevice(@Nullable final String deviceId) {
         Log.e(REACT_CLASS, "received deviceName " + deviceId);
-        try {
-            Log.e(REACT_CLASS, "devices size " + currentDevices.size());
-            MediaRouter.RouteInfo info = currentDevices.get(deviceId);
-            CastDevice device = CastDevice.getFromBundle(info.getExtras());
-            mCastManager.onDeviceSelected(device, info);
-        } catch (IllegalViewOperationException e) {
-            e.printStackTrace();
-        }
+        UiThreadUtil.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (devicesManager == null) return;
+                    List<MediaRouter.RouteInfo> devices = devicesManager.getRouters();
+                    Log.e(REACT_CLASS, "devices size " + devices.size());
+                    for (MediaRouter.RouteInfo device : devices) {
+                        if (device.getId().equals(deviceId)) {
+                            CastDevice castDevice = CastDevice.getFromBundle(device.getExtras());
+                            mCastManager.onDeviceSelected(castDevice, device);
+                            break;
+                        }
+                    }
+                } catch (IllegalViewOperationException e) {
+                    e.printStackTrace();
+                }
+            }
+        });
     }
 
     @ReactMethod
@@ -204,12 +226,15 @@ public class GoogleCastModule extends ReactContextBaseJavaModule implements Life
                 public void run() {
                     mCastManager.incrementUiCounter();
                     mCastManager.startCastDiscovery();
+                    if (devicesManager != null) {
+                        devicesManager.startScan();
+                    }
                 }
             });
 
             Log.e(REACT_CLASS, "Chromecast Initialized by getting instance");
         } else {
-            final CastConfiguration options = GoogleCastService.getCastConfig((appId != null ? appId : CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID ));
+            final CastConfiguration options = GoogleCastService.getCastConfig((appId != null ? appId : CastMediaControlIntent.DEFAULT_MEDIA_RECEIVER_APPLICATION_ID));
             UiThreadUtil.runOnUiThread(new Runnable() {
                 public void run() {
                     VideoCastManager.initialize(getCurrentActivity(), options);
@@ -237,22 +262,6 @@ public class GoogleCastModule extends ReactContextBaseJavaModule implements Life
                         }
 
                         @Override
-                        public void onRouteRemoved(MediaRouter.RouteInfo info) {
-                            super.onRouteRemoved(info);
-                            removeDevice(info);
-                        }
-
-                        @Override
-                        public void onCastDeviceDetected(MediaRouter.RouteInfo info) {
-                            super.onCastDeviceDetected(info);
-                            deviceAvailableParams = Arguments.createMap();
-                            Log.e(REACT_CLASS, "detecting devices " + info.getName());
-                            deviceAvailableParams.putBoolean("device_available", true);
-                            emitMessageToRN(getReactApplicationContext(), DEVICE_AVAILABLE, deviceAvailableParams);
-                            addDevice(info);
-                        }
-
-                        @Override
                         public void onApplicationConnectionFailed(int errorCode) {
                             Log.e(REACT_CLASS, "I failed :( with error code ");
                         }
@@ -261,19 +270,13 @@ public class GoogleCastModule extends ReactContextBaseJavaModule implements Life
                         public void onFailed(int resourceId, int statusCode) {
                             Log.e(REACT_CLASS, "I failed :( " + statusCode);
                         }
-
-                        @Override
-                        public void onCastAvailabilityChanged(boolean castPresent) {
-                            deviceAvailableParams = Arguments.createMap();
-                            Log.e(REACT_CLASS, "onCastAvailabilityChanged: exists? " + Boolean.toString(castPresent));
-                            deviceAvailableParams.putBoolean("device_available", castPresent);
-                            emitMessageToRN(getReactApplicationContext(), DEVICE_AVAILABLE, deviceAvailableParams);
-                        }
-
                     };
                     mCastManager.addVideoCastConsumer(mCastConsumer);
                     mCastManager.incrementUiCounter();
                     mCastManager.startCastDiscovery();
+                    devicesManager = new DevicesManager(getReactApplicationContext(),
+                            mCastManager.getMediaRouteSelector(), onChangeRoutes);
+                    devicesManager.startScan();
                     Log.e(REACT_CLASS, "Chromecast Initialized for the first time!");
                 }
             });
@@ -286,11 +289,9 @@ public class GoogleCastModule extends ReactContextBaseJavaModule implements Life
 
     @Override
     public void onHostPause() {
-
     }
 
     @Override
     public void onHostDestroy() {
-
     }
 }
